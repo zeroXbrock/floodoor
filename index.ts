@@ -1,20 +1,20 @@
 import { Wallet, providers, utils } from "ethers"
-import { formatEther } from 'ethers/lib/utils'
+import { formatEther, parseTransaction } from 'ethers/lib/utils'
 import MevFlood from "mev-flood"
 import Prompt from "prompt-sync"
 const prompt = Prompt()
 
 const admin = new Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
-const provider = new providers.JsonRpcProvider("http://localhost:8545", 5)
+const provider = new providers.JsonRpcProvider("http://localhost:8545", {chainId: 5, name: "anvil"})
 const userWallets = [...Array(10)].map(i => Wallet.createRandom())
-const deployfile = "./deployment.json"
+const deployFile = "./deployment.json"
 
 async function standard() {
 
     let flood: MevFlood
     try {
         // load existing deployment
-        flood = await new MevFlood(admin, provider).init(deployfile)
+        flood = await new MevFlood(admin, provider).withDeploymentFile(deployFile)
     } catch (e) {
         
         // spin up new deployment
@@ -27,13 +27,12 @@ async function standard() {
 
         // deploy liquidity
         await flood.liquid({
-            shouldTestSwap: false,
             wethMintAmountAdmin: 50,
-            wethMintAmountUser: 5,
+            wethMintAmountUser: 1,
         }, userWallets[0])
 
         // write deployment to file
-        await flood.saveDeployment(deployfile)
+        await flood.saveDeployment(deployFile)
     }
 
     console.log("weth", flood.deployment?.weth.contractAddress)
@@ -46,7 +45,6 @@ async function standard() {
             shouldDeploy: false,
             shouldBootstrapLiquidity: false,
             shouldMintTokens: true,
-            shouldTestSwap: false,
             wethMintAmountAdmin: 0,
             wethMintAmountUser: 5,
         }, wallet)
@@ -54,82 +52,71 @@ async function standard() {
 
     // send rounds of swaps from all accounts
     for (let i = 0; i < 3; i++) {
-        await flood.sendSwaps({minUSD: 100, maxUSD: 5000}, userWallets)
+        const swaps = await flood.generateSwaps({minUSD: 100, maxUSD: 5000}, userWallets)
+        await swaps.sendToMempool()
     }
 }
 
-const chaining = async () => {
-    // Async doesn't chain well
-    const flood1 = await (await new MevFlood(admin, provider)
-        .liquid({
-        wethMintAmountAdmin: 50,
-        wethMintAmountUser: 5,
-        }))
-        .fundWallets(userWallets.map(w => w.address), 1)
-
-    const flood2 = await new MevFlood(admin, provider)
-    .liquid({
-        wethMintAmountAdmin: 50,
-        wethMintAmountUser: 5,
-    }).then(flood => {
-        return flood.fundWallets(userWallets.map(w => w.address), 1)
-    })
-
-    const signedSwaps1 = (await flood1.sendSwaps({maxUSD: 5000, minUSD: 100}, userWallets)).signedSwaps
-    const signedSwaps2 = (await flood2.sendSwaps({maxUSD: 5000, minUSD: 100}, userWallets)).signedSwaps
-    await flood1.backrun(utils.parseTransaction(signedSwaps1[signedSwaps1.length - 1]))
-    await flood2.backrun(utils.parseTransaction(signedSwaps2[signedSwaps1.length - 1]))
-}
-
-const withDeployment = async () => {
+const withLiquid = async () => {
     const flood = new MevFlood(admin, provider)
     try {
-        const deployment = await MevFlood.loadDeployment("deployment.json")
+        const deployment = await MevFlood.loadDeployment(deployFile)
         // we have to fund wallets every time bc this script creates random wallets
         await flood.withDeployment(deployment).fundWallets(userWallets.map(w => w.address), 3)
-        await flood.withDeployment(deployment).sendSwaps({maxUSD: 1000}, userWallets)
+        const swaps = await flood.withDeployment(deployment).generateSwaps({maxUSD: 1000}, userWallets)
+        await swaps.sendToMempool()
     } catch (e) {
-        throw new Error(`failed to load deployment at '${deployfile}'`)
+        throw new Error(`failed to load deployment at '${deployFile}'`)
     }
     try {
-        const deployment = await MevFlood.loadDeployment("deployment.json")
+        const deployment = await MevFlood.loadDeployment(deployFile)
         const flood = new MevFlood(admin, provider, deployment)
         await flood.fundWallets(userWallets.map(w => w.address), 3)
-        await flood.sendSwaps({maxUSD: 1000}, userWallets)
+        const swaps = await flood.generateSwaps({maxUSD: 1000}, userWallets)
+        await swaps.sendToMempool()
     } catch (e) {
-        throw new Error(`failed to load deployment at '${deployfile}'`)
+        throw new Error(`failed to load deployment at '${deployFile}'`)
     }
 }
 
 const arbor = async () => {
+    const userWallet = new Wallet("0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6") // hh[3]
     const flood = new MevFlood(admin, provider)
-    const userWallet = Wallet.createRandom()
-    const daiIndex = 0
-    await flood.fundWallets([userWallet.address], 50)
-    await flood.liquid({wethMintAmountAdmin: 50, wethMintAmountUser: 10, shouldTestSwap: false}, userWallet)
-    const swapRes = await flood.sendSwaps({maxUSD: 10000, minUSD: 9001, swapWethForDai: true, daiIndex}, [userWallet])
-    const daiContract = flood.deployment?.getDeployedContracts(provider).dai[daiIndex]
-    const daiBalance = await daiContract?.balanceOf(admin.address)
-    console.log(`[before] DAI balance\t${formatEther(daiBalance)}`)
-    await flood.backrun(utils.parseTransaction(swapRes.signedSwaps[0]))
-    const newDaiBalance = await daiContract?.balanceOf(admin.address)
-    console.log(`[after] DAI balance\t${formatEther(daiBalance)}`)
-    console.log(`profit: ${formatEther(newDaiBalance.sub(daiBalance))} DAI`)
+
+    const fundRes = await flood.fundWallets([userWallet.address], 20)
+    await fundRes[0].wait(1)
+
+    const liquidRes = await flood.liquid({
+        wethMintAmountAdmin: 10,
+        wethMintAmountUser: 1,
+    }, userWallet)
+
+    const deployRes = await liquidRes.deployToMempool()
+    await Promise.all(deployRes.map(r => r.wait(1)))
+    const contracts = liquidRes.deployment.getDeployedContracts(provider)
+    const daiContract = contracts.dai[0]
+
+    // generate a swap from the user account
+    const swapRes = await flood.generateSwaps({minUSD: 500, maxUSD: 500, swapOnA: true, swapWethForDai: true, daiIndex: 0}, [userWallet], 0)
+    const swapResponse = await swapRes.sendToMempool()
+    const confirmedSwap = (await swapResponse[0].wait(1)).status === 1
+    if (confirmedSwap) {
+        console.error("swap landed")
+    }
+
+    const daiBalanceStart = await daiContract?.balanceOf(admin.address)
+
+    // backrun the swap w/ an arb
+    const backrun = await flood.backrun(parseTransaction(swapRes.swaps.signedSwaps[0]))
+    const backrunSendRes = await backrun.sendToMempool()
+    if ((await backrunSendRes?.wait())?.status === 1) {
+        console.log("backrun landed")
+    }
+
+    const daiBalanceAfter = await daiContract?.balanceOf(admin.address)
+    console.log(`[before] DAI balance\t${formatEther(daiBalanceStart)}`)
+    console.log(`[after] DAI balance\t${formatEther(daiBalanceAfter)}`)
+    console.log(`profit: ${formatEther(daiBalanceAfter.sub(daiBalanceStart))} DAI`)
 }
 
-const program = process.argv[2]
-if (program == "1") {
-    standard()
-} else if (program == "2") {
-    chaining()
-} else if (program == "3") {
-    withDeployment()
-} else if (program == "4") {
-    console.log("im arbiiiiiing")
-    arbor()
-}
-else {
-    console.warn("invalid entry, defaulting to 1 (main)")
-    prompt("press enter to proceed")
-    standard()
-}
+arbor()
